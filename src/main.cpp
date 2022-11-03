@@ -6,8 +6,12 @@
 #define BOARD_ID 4
 #define SWITCH_PIN 26
 #define DEVICE_PIN 25
-#define PIR 32
-#define PIR_INDICATOR 2
+#define FAILED_LIMIT 10
+#define DEBOUNCETIME 150
+
+volatile int numberOfButtonInterrupts = 0;
+volatile bool lastState;
+volatile uint32_t debounceTimeout = 0;
 
 bool DeviceState = false;
 bool SendedStatus = false;
@@ -24,10 +28,93 @@ typedef struct Device_Status {
     byte id : 4;
     byte WiFi_Channel;
     bool status;
-    bool PIR_reading;
 } Device_Status;
 
 Device_Status myData;
+
+byte Failed_Count = 0;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR handleButtonInterrupt() {
+    portENTER_CRITICAL_ISR(&mux);
+    numberOfButtonInterrupts++;
+    lastState = digitalRead(SWITCH_PIN);
+    debounceTimeout =
+        xTaskGetTickCount();  // version of millis() that works from interrupt
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+void taskButtonRead(void *parameter) {
+    String taskMessage = "Debounced ButtonRead Task running on core ";
+    taskMessage = taskMessage + xPortGetCoreID();
+    Serial.println(taskMessage);
+
+    // set up button Pin
+    pinMode(SWITCH_PIN, INPUT_PULLUP);  // Pull up to 3.3V on input - some
+    // buttons already have this done
+
+    attachInterrupt(digitalPinToInterrupt(SWITCH_PIN), handleButtonInterrupt,
+                    FALLING);
+
+    uint32_t saveDebounceTimeout;
+    bool saveLastState;
+    int save;
+
+    // Enter RTOS Task Loop
+    while (1) {
+        portENTER_CRITICAL_ISR(
+            &mux);  // so that value of numberOfButtonInterrupts,l astState are
+        // atomic - Critical Section
+        save = numberOfButtonInterrupts;
+        saveDebounceTimeout = debounceTimeout;
+        saveLastState = lastState;
+        portEXIT_CRITICAL_ISR(&mux);  // end of Critical Section
+
+        bool currentState = digitalRead(SWITCH_PIN);
+
+        // This is the critical IF statement
+        // if Interrupt Has triggered AND Button Pin is in same state AND the
+        // debounce time has expired THEN you have the button push!
+        //
+        if ((save != 0)                         // interrupt has triggered
+            && (currentState == saveLastState)  // pin is still in the same
+            // state as when intr triggered
+            && (millis() - saveDebounceTimeout >
+                DEBOUNCETIME)) {  // and it has been low for at least
+            // DEBOUNCETIME, then valid keypress
+
+            if (currentState == LOW) {
+                DeviceState = !DeviceState;
+                digitalWrite(DEVICE_PIN, DeviceState);
+
+                // Serial.printf(
+                //     "Button is pressed and debounced, current tick=%d\n",
+                //     millis());
+            } else {
+                Serial.printf(
+                    "Button is released and debounced, current tick=%d\n",
+                    millis());
+            }
+
+            // Serial.printf(
+            //     "Button Interrupt Triggered %d times, current State=%u, time
+            //     " "since last trigger %dms\n", save, currentState, millis() -
+            //     saveDebounceTimeout);
+
+            portENTER_CRITICAL_ISR(
+                &mux);  // can't change it unless, atomic - Critical section
+            numberOfButtonInterrupts =
+                0;  // acknowledge keypress and reset interrupt counter
+            portEXIT_CRITICAL_ISR(&mux);
+
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.print("\r\nLast Packet Send Status:\t");
@@ -35,16 +122,19 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
                                                   : "Delivery Fail");
 
     if (status != ESP_NOW_SEND_SUCCESS) {
+        Failed_Count++;
         if (Slave_On_Correct_Channel) {
             Serial.println("Raising flag");
             Slave_On_Correct_Channel = false;
         }
     } else {
-        if (!Slave_On_Correct_Channel) Slave_On_Correct_Channel = true;
+        Failed_Count = 0;
+        Slave_On_Correct_Channel = true;
     }
 }
 
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    Failed_Count = 0;
     char macStr[18];
     Serial.print("Packet received from: ");
     snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -62,6 +152,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
                 Serial.println("Request to turn off");
                 DeviceState = false;
             }
+            digitalWrite(DEVICE_PIN, DeviceState);
         }
     }
 }
@@ -90,41 +181,6 @@ void initPeers() {
     }
 }
 
-// bool ManageConnection() {
-//     if (!esp_now_is_peer_exist(peerInfo.peer_addr)) {
-//         Serial.println("No connection, attempt repair");
-//         esp_wifi_set_promiscuous(true);
-//         esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-//         esp_wifi_set_promiscuous(false);
-//         // Station not paired, attempt pair
-//         esp_err_t addStatus = esp_now_add_peer(&peerInfo);
-//         if (addStatus == ESP_OK) {
-//             // Pair success
-//             Serial.println("Pair success");
-//             return true;
-//         } else if (addStatus == ESP_ERR_ESPNOW_NOT_INIT) {
-//             // How did we get so far!!
-//             Serial.println("ESPNOW Not Init");
-//             return false;
-//         } else if (addStatus == ESP_ERR_ESPNOW_ARG) {
-//             Serial.println("Invalid Argument");
-//             return false;
-//         } else if (addStatus == ESP_ERR_ESPNOW_FULL) {
-//             Serial.println("Peer list full");
-//             return false;
-//         } else if (addStatus == ESP_ERR_ESPNOW_NO_MEM) {
-//             Serial.println("Out of memory");
-//             return false;
-//         } else if (addStatus == ESP_ERR_ESPNOW_EXIST) {
-//             Serial.println("Peer Exists");
-//             return true;
-//         } else {
-//             Serial.println("Not sure what happened");
-//             return false;
-//         }
-//     }
-// }
-
 void SendData() {
     esp_err_t outcome =
         esp_now_send(stationAddress, (uint8_t *)&myData, sizeof(myData));
@@ -134,9 +190,8 @@ void SendData() {
 }
 
 void Channeling_Monitor() {
-    while (!Slave_On_Correct_Channel && peerInfo.channel != 0) {
-        Serial.printf("Current channel %d. Switch to channel default(0)\n",
-                      peerInfo.channel);
+    while (!Slave_On_Correct_Channel) {
+        Serial.printf("Switch to channel default(0)\n");
         esp_wifi_set_promiscuous(true);
         esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
         esp_wifi_set_promiscuous(false);
@@ -158,17 +213,26 @@ void ChangeChannel() {
 void setup() {
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
-    pinMode(SWITCH_PIN, INPUT_PULLUP);
     pinMode(DEVICE_PIN, OUTPUT);
-    pinMode(PIR, INPUT);
-    pinMode(PIR_INDICATOR, OUTPUT);
+
+    xTaskCreatePinnedToCore(taskButtonRead,
+                            "TaskButton"  // A name just for humans
+                            ,
+                            2048  // This stack size can be checked & adjusted
+                                  // by reading the Stack Highwater
+                            ,
+                            NULL,
+                            1  // Priority, with 3 (configMAX_PRIORITIES - 1)
+                               // being the highest, and 0 being the lowest.
+                            ,
+                            NULL, ARDUINO_RUNNING_CORE);
+
 
     initESPNOW();
     initPeers();
 }
 
 void loop() {
-    digitalWrite(PIR_INDICATOR, digitalRead(PIR));
     Channeling_Monitor();
 
     while (myData.id == 0) {
@@ -176,30 +240,26 @@ void loop() {
         ChangeChannel();
         myData.id = BOARD_ID;
     }
-
-    if (!digitalRead(SWITCH_PIN)) {
-        DeviceState = !DeviceState;
-        delay(200);
-    }
-
-    digitalWrite(DEVICE_PIN, DeviceState);
+    
     if (DeviceState != SendedStatus) {
         myData.id = BOARD_ID;
         myData.status = DeviceState;
+
         SendData();
         SendedStatus = myData.status;
         delay(100);
     }
 
-    unsigned long currentMillis = millis();
-    if (currentMillis - previousMillis >= interval) {
-        // Save the last time a new reading was published
-        previousMillis = currentMillis;
-        // Set values to send
-        myData.id = BOARD_ID;
-        myData.PIR_reading = digitalRead(PIR);
-        SendData();
-        SendedStatus = myData.status;
-        Serial.println("Scheduled ping");
+    if (Failed_Count <= FAILED_LIMIT) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousMillis >= interval) {
+            // Save the last time a new reading was published
+            previousMillis = currentMillis;
+            // Set values to send
+            myData.id = BOARD_ID;
+            SendData();
+            SendedStatus = myData.status;
+            Serial.println("Scheduled ping");
+        }
     }
 }
