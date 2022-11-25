@@ -5,6 +5,7 @@
 
 #define BOARD_ID 4
 #define SWITCH_PIN 26
+#define detectPin 23
 #define DEVICE_PIN 25
 #define FAILED_LIMIT 10
 #define DEBOUNCETIME 150
@@ -35,86 +36,6 @@ Device_Status myData;
 byte Failed_Count = 0;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-
-void IRAM_ATTR handleButtonInterrupt() {
-    portENTER_CRITICAL_ISR(&mux);
-    numberOfButtonInterrupts++;
-    lastState = digitalRead(SWITCH_PIN);
-    debounceTimeout =
-        xTaskGetTickCount();  // version of millis() that works from interrupt
-    portEXIT_CRITICAL_ISR(&mux);
-}
-
-void taskButtonRead(void *parameter) {
-    String taskMessage = "Debounced ButtonRead Task running on core ";
-    taskMessage = taskMessage + xPortGetCoreID();
-    Serial.println(taskMessage);
-
-    // set up button Pin
-    pinMode(SWITCH_PIN, INPUT_PULLUP);  // Pull up to 3.3V on input - some
-    // buttons already have this done
-
-    attachInterrupt(digitalPinToInterrupt(SWITCH_PIN), handleButtonInterrupt,
-                    FALLING);
-
-    uint32_t saveDebounceTimeout;
-    bool saveLastState;
-    int save;
-
-    // Enter RTOS Task Loop
-    while (1) {
-        portENTER_CRITICAL_ISR(
-            &mux);  // so that value of numberOfButtonInterrupts,l astState are
-        // atomic - Critical Section
-        save = numberOfButtonInterrupts;
-        saveDebounceTimeout = debounceTimeout;
-        saveLastState = lastState;
-        portEXIT_CRITICAL_ISR(&mux);  // end of Critical Section
-
-        bool currentState = digitalRead(SWITCH_PIN);
-
-        // This is the critical IF statement
-        // if Interrupt Has triggered AND Button Pin is in same state AND the
-        // debounce time has expired THEN you have the button push!
-        //
-        if ((save != 0)                         // interrupt has triggered
-            && (currentState == saveLastState)  // pin is still in the same
-            // state as when intr triggered
-            && (millis() - saveDebounceTimeout >
-                DEBOUNCETIME)) {  // and it has been low for at least
-            // DEBOUNCETIME, then valid keypress
-
-            if (currentState == LOW) {
-                DeviceState = !DeviceState;
-                digitalWrite(DEVICE_PIN, DeviceState);
-
-                // Serial.printf(
-                //     "Button is pressed and debounced, current tick=%d\n",
-                //     millis());
-            } else {
-                Serial.printf(
-                    "Button is released and debounced, current tick=%d\n",
-                    millis());
-            }
-
-            // Serial.printf(
-            //     "Button Interrupt Triggered %d times, current State=%u, time
-            //     " "since last trigger %dms\n", save, currentState, millis() -
-            //     saveDebounceTimeout);
-
-            portENTER_CRITICAL_ISR(
-                &mux);  // can't change it unless, atomic - Critical section
-            numberOfButtonInterrupts =
-                0;  // acknowledge keypress and reset interrupt counter
-            portEXIT_CRITICAL_ISR(&mux);
-
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-}
-
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.print("\r\nLast Packet Send Status:\t");
@@ -189,16 +110,6 @@ void SendData() {
                       : Serial.println("Error sending device status");
 }
 
-void Channeling_Monitor() {
-    while (!Slave_On_Correct_Channel) {
-        Serial.printf("Switch to channel default(0)\n");
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-        esp_wifi_set_promiscuous(false);
-        Slave_On_Correct_Channel = true;
-    }
-}
-
 void ChangeChannel() {
     Serial.printf("\nTarget channel: %d\n", myData.WiFi_Channel);
     Serial.println("Channel before");
@@ -210,10 +121,148 @@ void ChangeChannel() {
     WiFi.printDiag(Serial);
 }
 
+void IRAM_ATTR handleButtonInterrupt() {
+    portENTER_CRITICAL_ISR(&mux);
+    numberOfButtonInterrupts++;
+    lastState = digitalRead(SWITCH_PIN);
+    debounceTimeout =
+        xTaskGetTickCount();  // version of millis() that works from interrupt
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR detectPinInterrupt() {
+    myData.status = digitalRead(detectPin) ? false : true;
+}
+
+void taskButtonRead(void *parameter) {
+    String taskMessage = "Debounced ButtonRead Task running on core ";
+    taskMessage = taskMessage + xPortGetCoreID();
+    Serial.println(taskMessage);
+
+    pinMode(DEVICE_PIN, OUTPUT);
+    // set up button Pin
+    pinMode(SWITCH_PIN, INPUT_PULLUP);  // Pull up to 3.3V on input - some
+    // buttons already have this done
+
+    attachInterrupt(digitalPinToInterrupt(SWITCH_PIN), handleButtonInterrupt,
+                    FALLING);
+
+    uint32_t saveDebounceTimeout;
+    bool saveLastState;
+    int save;
+
+    // Enter RTOS Task Loop
+    while (1) {
+        portENTER_CRITICAL_ISR(
+            &mux);  // so that value of numberOfButtonInterrupts,l astState are
+        // atomic - Critical Section
+        save = numberOfButtonInterrupts;
+        saveDebounceTimeout = debounceTimeout;
+        saveLastState = lastState;
+        portEXIT_CRITICAL_ISR(&mux);  // end of Critical Section
+
+        bool currentState = digitalRead(SWITCH_PIN);
+
+        // This is the critical IF statement
+        // if Interrupt Has triggered AND Button Pin is in same state AND the
+        // debounce time has expired THEN you have the button push!
+        //
+        if ((save != 0)                         // interrupt has triggered
+            && (currentState == saveLastState)  // pin is still in the same
+            // state as when intr triggered
+            && (millis() - saveDebounceTimeout >
+                DEBOUNCETIME)) {  // and it has been low for at least
+            // DEBOUNCETIME, then valid keypress
+
+            if (currentState == LOW) {
+                DeviceState = !DeviceState;
+                digitalWrite(DEVICE_PIN, DeviceState);
+
+                // Serial.printf(
+                //     "Button is pressed and debounced, current tick=%d\n",
+                //     millis());
+            } else {
+                Serial.printf(
+                    "Button is released and debounced, current tick=%d\n",
+                    millis());
+            }
+
+            // Serial.printf(
+            //     "Button Interrupt Triggered %d times, current State=%u, time
+            //     " "since last trigger %dms\n", save, currentState, millis() -
+            //     saveDebounceTimeout);
+
+            portENTER_CRITICAL_ISR(
+                &mux);  // can't change it unless, atomic - Critical section
+            numberOfButtonInterrupts =
+                0;  // acknowledge keypress and reset interrupt counter
+            portEXIT_CRITICAL_ISR(&mux);
+
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void schedulePingTask(void *parameter) {
+    while (1) {
+        if (Failed_Count <= FAILED_LIMIT) {
+            unsigned long currentMillis = millis();
+            if (currentMillis - previousMillis >= interval) {
+                // Save the last time a new reading was published
+                previousMillis = currentMillis;
+                // Set values to send
+                myData.id = BOARD_ID;
+                SendData();
+                SendedStatus = myData.status;
+                Serial.println("Scheduled ping");
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void deviceToggledReportTask(void *parameter) {
+    pinMode(detectPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(detectPin), detectPinInterrupt,
+                    CHANGE);
+    while (1) {
+        if (DeviceState != SendedStatus) {
+            myData.id = BOARD_ID;
+            myData.status = DeviceState; // remove this later
+            SendData();
+            SendedStatus = myData.status;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+void channelFixTask(void *parameter) {
+    while (1) {
+        while (myData.id == 0) {
+            // Change Wifi channel
+            ChangeChannel();
+            myData.id = BOARD_ID;
+        }
+
+        while (!Slave_On_Correct_Channel) {
+            Serial.printf("Switch to channel default(0)\n");
+            esp_wifi_set_promiscuous(true);
+            esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+            esp_wifi_set_promiscuous(false);
+            Slave_On_Correct_Channel = true;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
-    pinMode(DEVICE_PIN, OUTPUT);
+
+    initESPNOW();
+    initPeers();
 
     xTaskCreatePinnedToCore(taskButtonRead,
                             "TaskButton"  // A name just for humans
@@ -227,39 +276,12 @@ void setup() {
                             ,
                             NULL, ARDUINO_RUNNING_CORE);
 
-
-    initESPNOW();
-    initPeers();
+    xTaskCreatePinnedToCore(deviceToggledReportTask, "Detect Task", 2048, NULL,
+                            3, NULL, 0);
+    xTaskCreatePinnedToCore(schedulePingTask, "Ping task", 2048, NULL, 1, NULL,
+                            0);
+    xTaskCreatePinnedToCore(channelFixTask, "Channel task", 2048, NULL, 1, NULL,
+                            1);
 }
 
-void loop() {
-    Channeling_Monitor();
-
-    while (myData.id == 0) {
-        // Change Wifi channel
-        ChangeChannel();
-        myData.id = BOARD_ID;
-    }
-    
-    if (DeviceState != SendedStatus) {
-        myData.id = BOARD_ID;
-        myData.status = DeviceState;
-
-        SendData();
-        SendedStatus = myData.status;
-        delay(100);
-    }
-
-    if (Failed_Count <= FAILED_LIMIT) {
-        unsigned long currentMillis = millis();
-        if (currentMillis - previousMillis >= interval) {
-            // Save the last time a new reading was published
-            previousMillis = currentMillis;
-            // Set values to send
-            myData.id = BOARD_ID;
-            SendData();
-            SendedStatus = myData.status;
-            Serial.println("Scheduled ping");
-        }
-    }
-}
+void loop() {}
